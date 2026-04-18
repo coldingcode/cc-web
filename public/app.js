@@ -74,6 +74,49 @@
     },
   ];
 
+  // --- File Path Recognition Constants (Sprint 1) ---
+  // File path patterns are now defined inline in processFilePaths function
+  // to enable URL preprocessing protection
+  // Line number suffix: :42 or :10-25
+  const LINE_NUM_REGEX = /(?::(\d+)(?:-(\d+))?)$/;
+  // File extension to icon mapping (Sprint 3: extended)
+  const FILE_EXT_ICONS = {
+    js: { color: '#f7df1e', icon: 'JS' },
+    ts: { color: '#3178c6', icon: 'TS' },
+    py: { color: '#3776ab', icon: 'PY' },
+    json: { color: '#292929', icon: '{ }' },
+    md: { color: '#083fa1', icon: 'MD' },
+    css: { color: '#264de4', icon: 'CSS' },
+    html: { color: '#e34c26', icon: 'HTML' },
+    // Sprint 3: F008 extended file type icons
+    txt: { color: '#6b5a4d', icon: 'TXT' },
+    xml: { color: '#e3792b', icon: 'XML' },
+    yaml: { color: '#cb171e', icon: 'YML' },
+    yml: { color: '#cb171e', icon: 'YML' },
+    sh: { color: '#4eaa25', icon: 'SH' },
+    bat: { color: '#c1c1c1', icon: 'BAT' },
+    svg: { color: '#ffb13b', icon: 'SVG' },
+    png: { color: '#8b5e3c', icon: 'IMG' },
+    jpg: { color: '#8b5e3c', icon: 'IMG' },
+    jpeg: { color: '#8b5e3c', icon: 'IMG' },
+    gif: { color: '#8b5e3c', icon: 'IMG' },
+    webp: { color: '#8b5e3c', icon: 'IMG' },
+    zip: { color: '#78909c', icon: 'ZIP' },
+    tar: { color: '#78909c', icon: 'ZIP' },
+    gz: { color: '#78909c', icon: 'ZIP' },
+    rar: { color: '#78909c', icon: 'ZIP' },
+    pdf: { color: '#d32f2f', icon: 'PDF' },
+    default: { color: '#6b5a4d', icon: 'FILE' },
+  };
+  // Binary file extensions - downloaded directly without preview
+  const BINARY_EXTENSIONS = new Set([
+    'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico',
+    'zip', 'tar', 'gz', 'rar', '7z', 'bz2',
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
+    'exe', 'dll', 'so', 'dylib',
+    'mp3', 'mp4', 'wav', 'avi', 'mov', 'mkv',
+  ]);
+
   // --- State ---
   let ws = null;
   let authToken = localStorage.getItem('cc-web-token');
@@ -1836,8 +1879,190 @@
 
   function renderMarkdown(text) {
     if (!text) return '<div class="typing-indicator"><span></span><span></span><span></span></div>';
-    try { return marked.parse(text); }
-    catch { return escapeHtml(text); }
+    try {
+      let html = marked.parse(text);
+      html = processFilePaths(html);
+      return html;
+    } catch { return escapeHtml(text); }
+  }
+
+  /**
+   * Process file paths in HTML content, converting them to download links.
+   * Excludes paths inside <code> tags and URLs.
+   * Sprint 1: F001 + F002
+   * Fixed: URL exclusion now uses preprocessing to avoid regex edge cases
+   */
+  function processFilePaths(html) {
+    // Parse HTML and process file paths, including paths inside <code> tags
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+
+    // Process text nodes (including inside <code> tags, but skip <a> tags)
+    function processTextNode(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        let text = node.textContent;
+        const parent = node.parentElement;
+
+        // Skip if inside <a> tags (already a link)
+        if (parent && parent.tagName === 'A') {
+          return;
+        }
+
+        const originalText = text;
+        const replacements = [];
+
+        // Pre-process: Find and protect URLs to prevent path matching inside them
+        // URL pattern: protocol://domain/path
+        // Sprint 1 fix: Use * instead of + to match URLs with empty paths (e.g., "file:// " with trailing space)
+        const urlPattern = /(https?|ftp|file):\/\/[^\s<>"']*|(?=(?:https?|ftp|file):\/\/(?=\s|$))/gi;
+        const urlRanges = [];
+        let urlMatch;
+        while ((urlMatch = urlPattern.exec(text)) !== null) {
+          urlRanges.push({ start: urlMatch.index, end: urlMatch.index + urlMatch[0].length });
+        }
+
+        // Helper to check if a position is inside a URL
+        function isInsideUrl(start, end) {
+          return urlRanges.some(r => r.start <= start && end <= r.end);
+        }
+
+        // Find all file paths
+        // 1. Windows paths (C:\path or C:/path)
+        const winPattern = /[A-Za-z]:[\/\\][^\s<>"'|*?\x00-\x1f]+/g;
+        let match;
+        winPattern.lastIndex = 0;
+        while ((match = winPattern.exec(text)) !== null) {
+          const pathStr = match[0];
+          const startIndex = match.index;
+          // Skip if inside a URL
+          if (isInsideUrl(startIndex, startIndex + pathStr.length)) continue;
+          // Skip if already in replacements
+          const alreadyReplaced = replacements.some(r => r.start <= startIndex && r.end >= startIndex + pathStr.length);
+          if (alreadyReplaced) continue;
+          const fileInfo = parsePathWithLine(pathStr);
+          const html = createFileLinkHtml(fileInfo.path, fileInfo.line);
+          replacements.push({
+            start: startIndex,
+            end: startIndex + pathStr.length,
+            html: html
+          });
+        }
+
+        // 2. Unix paths (must have at least 2 path segments)
+        const unixPattern = /\/[\w.-]+(?:\/[\w.-]+)+(?:\.\w+)?(?::\d+(?:-\d+)?)?/g;
+        unixPattern.lastIndex = 0;
+        while ((match = unixPattern.exec(text)) !== null) {
+          const pathStr = match[0];
+          const startIndex = match.index;
+          // Skip if inside a URL
+          if (isInsideUrl(startIndex, startIndex + pathStr.length)) continue;
+          // Skip if already in replacements
+          const alreadyReplaced = replacements.some(r => r.start <= startIndex && r.end >= startIndex + pathStr.length);
+          if (alreadyReplaced) continue;
+          const fileInfo = parsePathWithLine(pathStr);
+          const html = createFileLinkHtml(fileInfo.path, fileInfo.line);
+          replacements.push({
+            start: startIndex,
+            end: startIndex + fileInfo.original.length,
+            html: html
+          });
+        }
+
+        // 3. Relative paths (./path or ../path)
+        const relPattern = /\.{1,2}\/[\w./-]+(?:\.\w+)?(?::\d+(?:-\d+)?)?/g;
+        relPattern.lastIndex = 0;
+        while ((match = relPattern.exec(text)) !== null) {
+          const pathStr = match[0];
+          const startIndex = match.index;
+          // Skip if inside a URL (shouldn't happen for relative paths, but check anyway)
+          if (isInsideUrl(startIndex, startIndex + pathStr.length)) continue;
+          // Skip if already in replacements
+          const alreadyReplaced = replacements.some(r => r.start <= startIndex && r.end >= startIndex + pathStr.length);
+          if (alreadyReplaced) continue;
+          const fileInfo = parsePathWithLine(pathStr);
+          const html = createFileLinkHtml(fileInfo.path, fileInfo.line);
+          replacements.push({
+            start: startIndex,
+            end: startIndex + fileInfo.original.length,
+            html: html
+          });
+        }
+
+        // Sort by position and apply replacements
+        if (replacements.length > 0) {
+          // Sort by start position descending to replace from end
+          replacements.sort((a, b) => b.start - a.start);
+
+          for (const r of replacements) {
+            text = text.slice(0, r.start) + r.html + text.slice(r.end);
+          }
+
+          // Create wrapper span to hold the new HTML
+          const span = document.createElement('span');
+          span.innerHTML = text;
+          node.parentNode.replaceChild(span, node);
+        }
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        // Recursively process child nodes (including <code> and <pre> tags)
+        for (const child of Array.from(node.childNodes)) {
+          if (child.tagName !== 'A') {
+            processTextNode(child);
+          }
+        }
+      }
+    }
+
+    processTextNode(doc.body);
+
+    return doc.body.innerHTML;
+  }
+
+  /**
+   * Parse a path string to extract path and optional line number
+   */
+  function parsePathWithLine(pathStr) {
+    const lineMatch = pathStr.match(LINE_NUM_REGEX);
+    if (lineMatch) {
+      const line = lineMatch[2] ? `${lineMatch[1]}-${lineMatch[2]}` : lineMatch[1];
+      return {
+        path: pathStr.slice(0, pathStr.length - lineMatch[0].length),
+        line: line,
+        original: pathStr
+      };
+    }
+    return { path: pathStr, line: null, original: pathStr };
+  }
+
+  /**
+   * Create HTML for a file path link
+   */
+  function createFileLinkHtml(pathStr, lineInfo) {
+    const ext = getFileExtension(pathStr);
+    const iconInfo = FILE_EXT_ICONS[ext] || FILE_EXT_ICONS.default;
+    // 只显示文件名，不显示完整路径
+    const filename = pathStr.split(/[/\\]/).pop();
+    const displayPath = filename;
+    const lineText = lineInfo ? `:${lineInfo}` : '';
+    const isBinary = BINARY_EXTENSIONS.has(ext);
+    const binaryHint = isBinary ? ' (二进制文件)' : '';
+
+    return `<span class="file-path-link" tabindex="0" role="button" aria-label="下载文件: ${escapeHtml(filename)}${binaryHint}" title="点击下载\n完整路径: ${escapeHtml(pathStr)}${binaryHint}" data-path="${escapeHtml(pathStr)}"${lineInfo ? ` data-line="${escapeHtml(lineInfo)}"` : ''}${isBinary ? ' data-binary="true"' : ''}>` +
+      `<span class="file-icon" data-ext="${ext}" style="--icon-color:${iconInfo.color}">${iconInfo.icon}</span>` +
+      `<span class="file-path-text">${escapeHtml(displayPath)}</span>` +
+      (lineText ? `<span class="file-line-info">${escapeHtml(lineText)}</span>` : '') +
+      '</span>';
+  }
+
+  /**
+   * Get file extension from path
+   */
+  function getFileExtension(path) {
+    const basename = path.split(/[/\\]/).pop();
+    const dotIndex = basename.lastIndexOf('.');
+    if (dotIndex > 0 && dotIndex < basename.length - 1) {
+      return basename.slice(dotIndex + 1).toLowerCase();
+    }
+    return '';
   }
 
   function createMsgElement(role, content, attachments = []) {
@@ -1869,8 +2094,7 @@
       if (content) {
         const textNode = document.createElement('div');
         textNode.className = 'msg-text';
-        textNode.style.whiteSpace = 'pre-wrap';
-        textNode.textContent = content;
+        textNode.innerHTML = renderMarkdown(content);
         bubble.appendChild(textNode);
       }
       if (attachments.length > 0) {
@@ -3169,9 +3393,16 @@
   });
 
   // --- Toast Notification ---
-  function showToast(text, sessionId) {
+  function showToast(text, sessionId, type = 'success') {
     const toast = document.createElement('div');
     toast.className = 'toast-notification';
+    if (type === 'error') {
+      toast.style.background = 'var(--danger, #c0553a)';
+    } else if (type === 'warning') {
+      toast.style.background = '#e3792b';
+    } else if (type === 'info') {
+      toast.style.background = 'var(--info, #5b7ea1)';
+    }
     toast.textContent = text;
     if (sessionId) {
       toast.style.cursor = 'pointer';
@@ -3187,6 +3418,111 @@
       setTimeout(() => toast.remove(), 300);
     }, 5000);
   }
+
+  // --- File Download Handler (Sprint 3: F006+F007) ---
+  /**
+   * Handle file path link click to download file
+   */
+  async function handleFileDownload(pathStr, element) {
+    if (!authToken) {
+      showToast('请先登录', null, 'error');
+      return;
+    }
+    if (!currentSessionId) {
+      showToast('无效的会话', null, 'error');
+      return;
+    }
+
+    // Check if already downloading
+    if (element.dataset.downloading === 'true') {
+      return;
+    }
+
+    // Set downloading state
+    element.dataset.downloading = 'true';
+    const originalContent = element.innerHTML;
+    element.innerHTML = '<span class="file-icon" style="--icon-color:#9a8b7d">⏳</span><span class="file-path-text">下载中...</span>';
+
+    const url = `/api/download?path=${encodeURIComponent(pathStr)}&session=${encodeURIComponent(currentSessionId)}`;
+
+    try {
+      const response = await fetch(url, {
+        headers: { 'Authorization': `Bearer ${authToken}` }
+      });
+
+      if (response.ok) {
+        // Get filename from Content-Disposition header
+        const disposition = response.headers.get('Content-Disposition');
+        let filename = pathStr.split(/[/\\]/).pop();
+        if (disposition) {
+          const match = disposition.match(/filename="?([^"]+)"?/);
+          if (match) filename = decodeURIComponent(match[1]);
+        }
+
+        // Trigger browser download
+        const blob = await response.blob();
+        const downloadUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(downloadUrl);
+
+        showToast(`已下载: ${filename}`, null, 'success');
+      } else {
+        // Handle error
+        let errorMsg = '下载失败';
+        try {
+          const data = await response.json();
+          errorMsg = data.message || errorMsg;
+        } catch {
+          // Use status-based messages
+          switch (response.status) {
+            case 401: errorMsg = '请先登录'; break;
+            case 400: errorMsg = '无效的请求'; break;
+            case 403: errorMsg = '文件不在工作目录范围内'; break;
+            case 404: errorMsg = '文件不存在'; break;
+            case 413: errorMsg = '文件超过 10MB 限制'; break;
+            case 500: errorMsg = '服务器错误，请重试'; break;
+          }
+        }
+        showToast(errorMsg, null, 'error');
+      }
+    } catch (err) {
+      showToast('网络错误，请重试', null, 'error');
+    } finally {
+      // Restore original content
+      element.innerHTML = originalContent;
+      element.dataset.downloading = 'false';
+    }
+  }
+
+  // Event delegation for file path link clicks
+  messagesDiv.addEventListener('click', (e) => {
+    const filePathLink = e.target.closest('.file-path-link');
+    if (filePathLink) {
+      const pathStr = filePathLink.dataset.path;
+      if (pathStr) {
+        handleFileDownload(pathStr, filePathLink);
+      }
+    }
+  });
+
+  // Keyboard support for file path links
+  messagesDiv.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      const filePathLink = e.target.closest('.file-path-link');
+      if (filePathLink) {
+        e.preventDefault();
+        const pathStr = filePathLink.dataset.path;
+        if (pathStr) {
+          handleFileDownload(pathStr, filePathLink);
+        }
+      }
+    }
+  });
 
   // --- Browser Notification (via Service Worker for mobile) ---
   function showBrowserNotification(title) {

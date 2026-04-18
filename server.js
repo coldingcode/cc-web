@@ -854,10 +854,22 @@ const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.ts': 'text/typescript; charset=utf-8',
   '.json': 'application/json',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.py': 'text/x-python; charset=utf-8',
   '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
+  '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
 };
 
 // === Utility Functions ===
@@ -1679,6 +1691,102 @@ const server = http.createServer((req, res) => {
     }
     removeAttachmentById(id);
     return jsonResponse(res, 200, { ok: true });
+  }
+
+  // === File Download API ===
+  // GET /api/download?path=<filePath>&session=<sessionId>
+  if (req.method === 'GET' && url.pathname === '/api/download') {
+    const token = extractBearerToken(req);
+    if (!token || !activeTokens.has(token)) {
+      return jsonResponse(res, 401, { ok: false, message: 'Not authenticated' });
+    }
+
+    const rawPath = url.searchParams.get('path');
+    const sessionId = url.searchParams.get('session');
+
+    if (!rawPath) {
+      return jsonResponse(res, 400, { ok: false, message: '缺少文件路径参数' });
+    }
+    if (!sessionId) {
+      return jsonResponse(res, 400, { ok: false, message: '缺少会话 ID 参数' });
+    }
+
+    // Load session to get cwd
+    const session = loadSession(sessionId);
+    if (!session) {
+      return jsonResponse(res, 400, { ok: false, message: '无效的会话 ID' });
+    }
+
+    const sessionCwd = session.cwd;
+    if (!sessionCwd) {
+      return jsonResponse(res, 400, { ok: false, message: '会话没有设置工作目录' });
+    }
+
+    // Resolve path (handle both absolute and relative paths)
+    let resolvedPath;
+    const isWindowsAbsolute = /^[A-Za-z]:[/\\]/.test(rawPath);
+    const isUnixAbsolute = rawPath.startsWith('/');
+
+    if (isWindowsAbsolute || isUnixAbsolute) {
+      // Absolute path: resolve and normalize
+      resolvedPath = path.resolve(rawPath);
+    } else {
+      // Relative path: resolve relative to session cwd
+      resolvedPath = path.resolve(sessionCwd, rawPath);
+    }
+
+    // Security check: ensure resolved path is within session cwd
+    // Normalize both paths for comparison (handle trailing slashes, symlinks, etc.)
+    const normalizedCwd = path.resolve(sessionCwd);
+    const normalizedPath = path.resolve(resolvedPath);
+
+    // Check if the resolved path is within the cwd boundary
+    if (!normalizedPath.startsWith(normalizedCwd + path.sep) && normalizedPath !== normalizedCwd) {
+      plog('WARN', 'download_path_traversal', { sessionId, rawPath, resolvedPath: normalizedPath, cwd: normalizedCwd });
+      return jsonResponse(res, 403, { ok: false, message: '路径超出会话工作目录范围' });
+    }
+
+    // Check if file exists
+    if (!fs.existsSync(normalizedPath)) {
+      return jsonResponse(res, 404, { ok: false, message: '文件不存在' });
+    }
+
+    // Check if it's a file (not a directory)
+    try {
+      const stat = fs.statSync(normalizedPath);
+      if (!stat.isFile()) {
+        return jsonResponse(res, 400, { ok: false, message: '路径不是文件' });
+      }
+
+      // Check file size (10MB limit)
+      const MAX_FILE_SIZE = 10 * 1024 * 1024;
+      if (stat.size > MAX_FILE_SIZE) {
+        return jsonResponse(res, 413, { ok: false, message: '文件超过 10MB 限制' });
+      }
+    } catch (err) {
+      return jsonResponse(res, 500, { ok: false, message: `无法访问文件: ${err.message}` });
+    }
+
+    // Read and return file
+    try {
+      const fileContent = fs.readFileSync(normalizedPath);
+      const filename = path.basename(normalizedPath);
+      const ext = path.extname(normalizedPath);
+      const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
+
+      res.writeHead(200, {
+        'Content-Type': mimeType,
+        'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+        'Content-Length': fileContent.length,
+        'Cache-Control': 'no-cache',
+      });
+      res.end(fileContent);
+      plog('INFO', 'download_success', { sessionId, path: normalizedPath, size: fileContent.length });
+    } catch (err) {
+      plog('ERROR', 'download_read_error', { sessionId, path: normalizedPath, error: err.message });
+      return jsonResponse(res, 500, { ok: false, message: `读取文件失败: ${err.message}` });
+    }
+    return;
   }
 
   let filePath = path.join(PUBLIC_DIR, url.pathname === '/' ? 'index.html' : url.pathname);
@@ -2963,6 +3071,7 @@ function handleMessage(ws, msg, options = {}) {
   const errorFd = fs.openSync(errorPath, 'w');
 
   let proc;
+  let fdsClosed = false;
   try {
     let stdinSource;
     if (useStreamJson) {
@@ -2978,6 +3087,23 @@ function handleMessage(ws, msg, options = {}) {
       detached: !IS_WIN,
       windowsHide: true,
     });
+
+    // Handle async spawn errors (ENOENT etc.) before attaching stdin
+    proc.on('error', (spawnErr) => {
+      if (!fdsClosed) {
+        fdsClosed = true;
+        fs.closeSync(outputFd);
+        fs.closeSync(errorFd);
+      }
+      cleanRunDir(currentSessionId);
+      plog('ERROR', 'process_spawn_error', { sessionId: currentSessionId.slice(0, 8), error: spawnErr.message });
+      const agent = getSessionAgent(session);
+      const helpfulMsg = spawnErr.code === 'ENOENT'
+        ? `${agent === 'codex' ? 'Codex' : 'Claude'} CLI 未安装或不在 PATH 中。请安装后重试，或设置环境变量 ${agent === 'codex' ? 'CODEX_PATH' : 'CLAUDE_PATH'} 指定完整路径。`
+        : spawnErr.message;
+      wsSend(ws, { type: 'error', message: helpfulMsg });
+    });
+
     if (useStreamJson) {
       // Write the stream-json message then close stdin so Claude knows input is done
       proc.stdin.write(fs.readFileSync(inputPath));
@@ -2994,8 +3120,18 @@ function handleMessage(ws, msg, options = {}) {
     return wsSend(ws, { type: 'error', message: formatRuntimeError(agent, err.message, { exitCode: null, signal: null }) });
   }
 
-  fs.closeSync(outputFd);
-  fs.closeSync(errorFd);
+  // Close fds if not already closed by error handler
+  if (!fdsClosed) {
+    fdsClosed = true;
+    fs.closeSync(outputFd);
+    fs.closeSync(errorFd);
+  }
+
+  // If spawn failed asynchronously (ENOENT), pid may be undefined
+  if (!proc.pid) {
+    cleanRunDir(currentSessionId);
+    return;
+  }
 
   fs.writeFileSync(path.join(dir, 'pid'), String(proc.pid));
   proc.unref(); // Process survives Node.js exit

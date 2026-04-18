@@ -11,3 +11,5 @@ config/dev.json
 config/host/
 CLAUDE.md
 AGENTS.md
+bun.lock
+pnpm.lock
